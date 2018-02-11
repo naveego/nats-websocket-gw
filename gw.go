@@ -14,6 +14,16 @@ import (
 type ErrorHandler func(error)
 type ConnectHandler func(*NatsConn, *websocket.Conn) error
 
+// FilterFactory is a function which returns a Filter
+// This will be invoked once for each connection. Filter.Reader will
+// be called to wrap every read from the websocket, while the Filter.Writer
+// will be called to wrap every write to the websocket.
+type FilterFactory func(r *http.Request) Filter
+type Filter interface {
+	Reader(io.Reader) io.Reader
+	Writer(io.WriteCloser) io.WriteCloser
+}
+
 type NatsServerInfo string
 
 type Settings struct {
@@ -21,6 +31,7 @@ type Settings struct {
 	EnableTls      bool
 	TlsConfig      *tls.Config
 	ConnectHandler ConnectHandler
+	FilterFactory  FilterFactory
 	ErrorHandler   ErrorHandler
 	WSUpgrader     *websocket.Upgrader
 	Trace          bool
@@ -30,6 +41,7 @@ type Gateway struct {
 	settings      Settings
 	onError       ErrorHandler
 	handleConnect ConnectHandler
+	makeFilter    FilterFactory
 }
 
 var defaultUpgrader = websocket.Upgrader{
@@ -61,6 +73,10 @@ func defaultErrorHandler(err error) {
 	fmt.Println("[ERROR]", err)
 }
 
+func defaultFilterFactory(r *http.Request) Filter {
+	return nil
+}
+
 func copyAndTrace(prefix string, dst io.Writer, src io.Reader, buf []byte) (int64, error) {
 	read, err := src.Read(buf)
 	if err != nil {
@@ -80,7 +96,16 @@ func NewGateway(settings Settings) *Gateway {
 	}
 	gw.setErrorHandler(settings.ErrorHandler)
 	gw.setConnectHandler(settings.ConnectHandler)
+	gw.setFilterFactory(settings.FilterFactory)
 	return &gw
+}
+
+func (gw *Gateway) setFilterFactory(factory FilterFactory) {
+	if factory == nil {
+		gw.makeFilter = defaultFilterFactory
+	} else {
+		gw.makeFilter = factory
+	}
 }
 
 func (gw *Gateway) setErrorHandler(handler ErrorHandler) {
@@ -99,7 +124,7 @@ func (gw *Gateway) setConnectHandler(handler ConnectHandler) {
 	}
 }
 
-func (gw *Gateway) natsToWsWorker(ws *websocket.Conn, src CommandsReader, doneCh chan<- bool) {
+func (gw *Gateway) natsToWsWorker(ws *websocket.Conn, src CommandsReader, filter Filter, doneCh chan<- bool) {
 	defer func() {
 		doneCh <- true
 	}()
@@ -113,14 +138,27 @@ func (gw *Gateway) natsToWsWorker(ws *websocket.Conn, src CommandsReader, doneCh
 		if gw.settings.Trace {
 			fmt.Println("[TRACE] <--", string(cmd))
 		}
-		if err := ws.WriteMessage(websocket.TextMessage, cmd); err != nil {
+		w, err := ws.NextWriter(websocket.TextMessage)
+		if err != nil {
 			gw.onError(err)
 			return
+		}
+
+		if filter != nil {
+			w = filter.Writer(w)
+		}
+
+		if _, err = w.Write(cmd); err != nil {
+			gw.onError(err)
+			return
+		}
+		if err = w.Close(); err != nil {
+			gw.onError(err)
 		}
 	}
 }
 
-func (gw *Gateway) wsToNatsWorker(nats net.Conn, ws *websocket.Conn, doneCh chan<- bool) {
+func (gw *Gateway) wsToNatsWorker(nats net.Conn, ws *websocket.Conn, filter Filter, doneCh chan<- bool) {
 	defer func() {
 		doneCh <- true
 	}()
@@ -134,6 +172,11 @@ func (gw *Gateway) wsToNatsWorker(nats net.Conn, ws *websocket.Conn, doneCh chan
 			gw.onError(err)
 			return
 		}
+
+		if filter != nil {
+			src = filter.Reader(src)
+		}
+
 		if gw.settings.Trace {
 			_, err = copyAndTrace("-->", nats, src, buf)
 		} else {
@@ -164,8 +207,10 @@ func (gw *Gateway) Handler(w http.ResponseWriter, r *http.Request) {
 
 	doneCh := make(chan bool)
 
-	go gw.natsToWsWorker(wsConn, natsConn.CmdReader, doneCh)
-	go gw.wsToNatsWorker(natsConn.Conn, wsConn, doneCh)
+	filter := gw.makeFilter(r)
+
+	go gw.natsToWsWorker(wsConn, natsConn.CmdReader, filter, doneCh)
+	go gw.wsToNatsWorker(natsConn.Conn, wsConn, filter, doneCh)
 
 	<-doneCh
 
@@ -205,7 +250,7 @@ func (gw *Gateway) initNatsConnectionForWSConn(wsConn *websocket.Conn) (*NatsCon
 
 	natsConn.ServerInfo = info
 
-	// optionnaly initialize the TLS layer
+	// optionally initialize the TLS layer
 	// TODO check if the server requires TLS, which overrides the 'enableTls' setting
 	if gw.settings.EnableTls {
 		tlsConfig := gw.settings.TlsConfig

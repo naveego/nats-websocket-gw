@@ -4,6 +4,10 @@ A websocket gateway for NATS, usable as a backend for
 [elm-nats](https://github.com/orus-io/elm-nats) and
 [websocket-nats](https://github.com/isobit/websocket-nats).
 
+This fork provides authentication/authorization in front of the NATS server.
+
+
+
 Features:
 
 - TLS support
